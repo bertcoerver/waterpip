@@ -22,7 +22,7 @@ from openpyxl import load_workbook
 import scipy.stats as sts
 import win32com.client
 
-
+ee.Initialize()
 
 class trend_sheet(object):
     
@@ -549,7 +549,7 @@ class trend_sheet(object):
         self.combine()
         
 #%%    
-ee.Initialize()
+
 
 # 100m example
 sheet = trend_sheet('Wonji', 
