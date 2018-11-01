@@ -16,57 +16,24 @@ from cartopy.mpl.gridliner import LONGITUDE_FORMATTER, LATITUDE_FORMATTER
 import cartopy.feature as feature
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import cartopy.io.shapereader as shpreader
-import urllib
-import zipfile
 from openpyxl import load_workbook
 import scipy.stats as sts
 import win32com.client
+import geegis
 
 ee.Initialize()
 
 class trend_sheet(object):
     
-    def fixTIMERES(self, VAR):
+    def __init__(self, name, shape, OutputFolder, mask = False):
         
-        def _fixTIMERES(year):
+        AGBP = 'projects/fao-wapor/L2/L2_AGBP_S'
+        WP = 'projects/fao-wapor/L2/L2_GBWP_S'
+        P = 'projects/fao-wapor/L1/L1_PCP_E'
+        ETref = 'projects/fao-wapor/L1/L1_RET_E'
+        PHEN = 'projects/fao-wapor/L2/L2_PHE_S'
+        LULC = 'projects/fao-wapor/L1/L1_LCC_A'
 
-            year = ee.Number(year)
-
-            VARnew = VAR.filterDate(ee.Date.fromYMD(year, 1, 1), ee.Date.fromYMD(year.add(1), 1, 1))
-            
-            time = VARnew.first().get('system:time_start')
-            multiplier = VARnew.first().get('multiplier')
-            unit = VARnew.first().get('unit')
-            
-            VARyear = VARnew.reduce(ee.Reducer.sum())
-          
-            VARyear = VARyear.set('system:time_start', time).set('multiplier', multiplier).set('unit', unit).set('year', year)
-            
-            return VARyear
-
-        years = ee.List.sequence(self.Start, self.End, 1)
-        
-        VARyearly = ee.ImageCollection(years.map(_fixTIMERES))
-        
-        return VARyearly
-
-    def calc_AGBP(self, NPP):
-        def _calc_AGBP(image):
-              time = image.get('system:time_start')
-              multiplier = image.get('multiplier')
-              unit = image.get('unit')
-              agbp = image.multiply(0.01444).multiply(image.metadata('n_days_extent'))
-              agbp = agbp.set('system:time_start', time).set('multiplier', multiplier).set('unit', unit)
-              return agbp
-        NPP = ee.ImageCollection(NPP)
-        
-        AGBP = NPP.map(_calc_AGBP)
-        
-        return AGBP
-        
-    
-    def __init__(self, name, AGBP, ET, P, ETref, CountryShape, OutputFolder, NPP = None):
-        
         # Turn of the visibility of matplotlib figures (i.e. figures remain invisble until saved as a file or after plt.show())
         plt.ioff()
         
@@ -75,51 +42,70 @@ class trend_sheet(object):
         # Create figure object
         self.initFigure()
         
-        # Determine start and end years available in ET image collection
-        self.Start = ee.Date(ee.ImageCollection(ET).aggregate_min('system:time_start')).get('year').getInfo()
-        self.End = ee.Date(ee.ImageCollection(ET).aggregate_max('system:time_start')).get('year').getInfo()
-        
-        # Calculate AGBP if NPP is given instead of AGBP
-        if NPP != None:
-            self.AGBP_dekad = self.calc_AGBP(NPP)
-            AGBP = self.fixTIMERES(self.AGBP_dekad)
-        
-        # Create dictionary with all the image collections
-        self.VARS = {"ET": ee.ImageCollection(ET).set('variable', 'ET Actual'),
+        # Create a mask image from the shapefile
+        self.CountryShape = ee.FeatureCollection(shape)
+        self.CountryMask = self.CountryShape.map(lambda sh: sh.set('1', 1)).reduceToImage(['1'], ee.Reducer.max()).unmask().cast({"max": "uint8"})
+
+        self.VARS = {"WP": ee.ImageCollection(WP).set('variable', 'Water Productivity'),
                      "P": ee.ImageCollection(P).set('variable', 'Precipitation'),
                      "AGBP": ee.ImageCollection(AGBP).set('variable', 'Above Ground Biomass Prod.'),
-                     "ET0": ee.ImageCollection(ETref).set('variable', "Reference ET")}
-
-        # Adjust the AGBP unit and correct the multiplier value in the metadata
-        self.correct_AGBP()
+                     "ET0": ee.ImageCollection(ETref).set('variable', "Reference ET"),
+                     "PHEN": ee.ImageCollection(PHEN).set('variable', "Phenology")}
+        
+        self.Start = ee.Date(self.VARS['WP'].aggregate_min('system:time_start')).get('year').getInfo()
+        self.End = ee.Date(self.VARS['WP'].aggregate_max('system:time_start')).get('year').getInfo()
+          
+        if mask:
+            lulc = ee.ImageCollection(LULC).filterDate('2013-01-01', '2013-12-31').first()
+            lulc = ee.Image(lulc)
+            def _mask_LULC(img):
+                img = ee.Image(img)
+                if len(mask) == 1:
+                    img_masked = img.updateMask(lulc.eq(mask[0]))
+                elif len(mask) == 2:
+                    img_masked = img.updateMask(lulc.gte(41)).updateMask(lulc.lt(43))
+                return ee.Image(img_masked).copyProperties(img, img.propertyNames())
+            
+            for varname, VAR in self.VARS.items():
+                self.VARS[varname] = ee.ImageCollection(VAR.map(_mask_LULC).copyProperties(VAR, VAR.propertyNames()))
+                
+        self.correct_metadata_AGBP()
+        
+        self.VARS["P"] = self.make_seasons("P")
+        self.VARS["ET0"] = self.make_seasons("ET0")
+        
+        def _mask_nodata(img):
+            img = ee.Image(img)
+            return img.updateMask(img.gte(0))
+        
+        def _apply_multiplier(img):
+            return img.multiply(ee.Number(img.get("multiplier"))).copyProperties(img,img.propertyNames().remove('multiplier'))
+        
+        for varname, VAR in self.VARS.items():
+            self.VARS[varname] = ee.ImageCollection(VAR.map(_mask_nodata))
+            
+        for varname, VAR in self.VARS.items():
+            print("applying multiplier to", varname)
+            self.VARS[varname] = ee.ImageCollection(VAR.map(_apply_multiplier))
+            
+        def _calc_area(img):
+            return ee.Image.pixelArea().multiply(img.gte(0)).copyProperties(img, img.propertyNames()).set('unit', 'm2')
+        
+        self.VARS['areas'] = self.VARS['WP'].map(_calc_area).select([0], ['b1'])
+        
+        self.calcET()
         
         # Determine the resolution to be used
-        self.scale = ee.Image(self.VARS['ET'].select('b1_sum').first()).projection().nominalScale()
-
-        # Create a mask image from the shapefile
-        self.CountryShape = ee.FeatureCollection(CountryShape)
-        self.CountryMask = self.CountryShape.map(lambda sh: sh.set('1', 1)).reduceToImage(['1'], ee.Reducer.max()).unmask().cast({"max": "uint8"})
+        img = ee.Image(self.VARS['AGBP'].first())
+        self.scale = img.select(img.bandNames()).projection().nominalScale()
 
         # Calculate the total area of the AOI
         self.Area = self.CountryShape.geometry().area().getInfo()
-        
+
         self.OutFldr = OutputFolder
         
         # Set which variables to show in which columns
-        self.Columns = {'AGBP': {'pos': 0}, 'ET': {'pos': 1}, 'WP': {'pos': 2}, 'YIELD': {'pos': 0}, 'P': {}, 'ET0': {}}
-        
-        # Set the Harvest Index and Water Content to be used
-        # --> This should become input into the function. If HI = 1.0 and WC = 0.0, the first column should show 
-        # --> the AGBP, otherwise the Yield. Also, then the WP needs to be calculated with base = 'YIELD' (also see make2)
-        self.HI = 1.00
-        self.WC = 0.00
-        
-        # Convert time resolution to yearly for required datasets
-        for varname, VAR in self.VARS.items():
-            if VAR.first().get('time_resolution').getInfo() != 'YEAR':
-                print(varname)
-                self.VARS[varname] = self.fixTIMERES(VAR)
-        
+        self.Columns = {'AGBP_yr': {'pos': 0}, 'ET_yr': {'pos': 1}, 'WP_yr': {'pos': 2}}
 
     def initFigure(self):
         self.f = plt.figure(1)
@@ -128,36 +114,50 @@ class trend_sheet(object):
         self.f.set_size_inches(16.54, 11.69) # A3 size
         self.gs = gridspec.GridSpec(3, 3, height_ratios=[1,1,2])
         
-    def correct_AGBP(self):
+    def correct_metadata_AGBP(self):
         def _correct_AGBP(img):
-            date = img.get('system:time_start')
-            img = img.multiply(10)
-            img = img.set('multiplier', 0.1)
-            img = img.set('unit', 'kg/ha').set('system:time_start', date).set('time_resolution', 'YEAR')     # Correct the multiplier value (should be 0.1?) and convert unit to kg.ha 
-            return img
+            new_img = img.set('multiplier', 1.0)
+            return new_img
+        
         self.VARS['AGBP'] = self.VARS['AGBP'].map(_correct_AGBP)
         
-    def calcWP(self, base = 'AGBP'):
+    def calcWP(self, base = 'AGBP_yr'):
         
         def _calcWP(year):
             agbp = ee.Image(self.VARS[base].filterMetadata('system:time_start', 'equals', year).first())
-            agbp = agbp.multiply(ee.Number(agbp.get("multiplier"))) ## kgC/ha
-              
-            et = ee.Image(self.VARS['ET'].filterMetadata('system:time_start', 'equals', year).first())
-            et = et.multiply(ee.Number(et.get("multiplier"))) ## mm
-            wp = agbp.divide(et.multiply(10)).set('system:time_start', year).set('multiplier', 1.0).set('unit', 'kg/m3')
+            et = ee.Image(self.VARS['ET_yr'].filterMetadata('system:time_start', 'equals', year).first())
+            wp = agbp.divide(et.multiply(10)).set('system:time_start', year).set('unit', 'kg/m3')
             
             return wp
     
         years = ee.List(self.VARS[base].aggregate_array('system:time_start'))
-        self.VARS['WP'] = ee.ImageCollection(years.map(_calcWP)).set('variable', 'Water Productivity')
-        
-    def calcTREND(self, VAR):
+        self.VARS['WP_yr'] = ee.ImageCollection(years.map(_calcWP)).set('variable', 'Water Productivity')
 
+    def calcET(self):
+        
+        def _calcET(agbp):
+            
+            current_year = agbp.get('system:time_start')
+            current_season = agbp.get('season')
+            
+            wp = ee.Image(self.VARS['WP'].filterMetadata('system:time_start', 'equals', current_year).filterMetadata('season', 'equals', current_season).first())
+
+            et = agbp.divide(wp).divide(10) # mm
+            
+            et = et.set('system:time_start', current_year).set('season', current_season).set('unit', 'mm') 
+            
+            return et
+
+        self.VARS['ET'] = ee.ImageCollection(self.VARS['AGBP'].map(_calcET)).set('variable', 'ET')
+
+    def calcTREND(self, VAR):
+        
+        band_name = ee.Image(VAR.first()).bandNames().getInfo()[0]
+        
         start = VAR.aggregate_min('system:time_start')
-        first = ee.Image(VAR.filterMetadata('system:time_start', 'equals', start).first()).select("b1_sum")
+        first = ee.Image(VAR.filterMetadata('system:time_start', 'equals', start).first()).select(band_name)
           
-        trend = VAR.select("b1_sum").formaTrend()
+        trend = VAR.select(band_name).formaTrend()
         
         def add_timeband(VARimg):
             date = ee.Date(VARimg.get("system:time_start"))
@@ -169,32 +169,7 @@ class trend_sheet(object):
         trend = trend.select('long-trend').divide(first).multiply(100)
         trend = trend.addBands(self.CountryMask).addBands(pearson)
         
-        return trend
-    
-    def downloadImage(self, image, output_fh, shape, scale):
-    
-        region = ee.Geometry(shape.geometry().bounds(1).getInfo()).toGeoJSONString()
-        
-        params = {
-                  'name':'test',
-                  'crs': 'EPSG:4326',
-                  'scale': scale,
-                  'region': region
-                 }
-        
-        url = image.getDownloadURL(params)
-    
-        succes = True
-        while succes:
-            try:
-                print "start download"
-                urllib.urlretrieve(url, output_fh)
-                zip_ref = zipfile.ZipFile(output_fh, 'r')
-                zip_ref.extractall(output_fh[:-4])
-                zip_ref.close()
-                succes = False
-            except:
-                pass    
+        return trend 
             
     def createTRENDMAP(self, varname):
         trend = self.calcTREND(self.VARS[varname])
@@ -203,7 +178,7 @@ class trend_sheet(object):
         self.factor = np.interp(self.Area, [50000, 625000000], [0.1, 1.0])
         scale = self.scale.multiply(self.factor).getInfo()
 
-        self.downloadImage(trend, output_fh, self.CountryShape, scale)
+        geegis.downloadImage(trend, output_fh, self.CountryShape, scale)
         
         TREND = becgis.OpenAsArray(os.path.join(output_fh[:-4], 'test.long-trend.tif'))
         MASK = becgis.OpenAsArray(os.path.join(output_fh[:-4], 'test.max.tif'))
@@ -212,6 +187,7 @@ class trend_sheet(object):
         assert np.shape(TREND) == np.shape(MASK), "resolution dont match"
         
         TREND[MASK == 0] = np.nan
+        TREND[TREND == 0.0000000000] = np.nan # need to fix this properly.
         TREND[PVALUE > 0.1] = np.nan
 
         PVALUE[PVALUE <= 0.1] = np.nan
@@ -230,48 +206,21 @@ class trend_sheet(object):
         n_rows = ds.RasterYSize
         ds = None
         self.extent_ll = (gt[0], gt[0] + (gt[1] * n_cols), gt[3] + (gt[5] * n_rows), gt[3])
-
-    def createTS(self, varname, reducer = ee.Reducer.mean()):
-        def _createTS(VARimg):
-            date = ee.Date(VARimg.get("system:time_start"))
-                  
-            VARyear = VARimg.multiply(ee.Number(VARimg.get("multiplier"))).reduceRegion(reducer = reducer, geometry = self.CountryShape, maxPixels = 1e12, scale = self.scale)
-                                                     
-            VARft = ee.Feature(None, {"date": date,
-                                      "year": date.get("year"),
-                                      "unit": VARimg.get("unit")})
-                                                
-            VARft = VARft.set(VARyear)
-                  
-            return VARft
-
-        VARts = self.VARS[varname].map(_createTS)
-        
-        unit = '[' + VARts.aggregate_first('unit').getInfo().replace(u'\xb2', '2') + '/yr]'
-        
-        VARts = np.array([VARts.aggregate_array('year').getInfo(), VARts.aggregate_array('b1_sum').getInfo()])
-        
-        if not reducer == ee.Reducer.mean():
-            self.Columns[varname]['TS95'] = VARts
-            self.Columns[varname]['unit'] = unit
-        else:
-            self.Columns[varname]['TS'] = VARts
-            self.Columns[varname]['unit'] = unit            
     
     def plotTS(self, varname):
+        
         ax = plt.subplot(self.gs[0, self.Columns[varname]['pos']])
             
-        yrs = self.Columns[varname]['TS'][0].astype(int)
-        vals = self.Columns[varname]['TS'][1]
-        
-        unit = self.Columns[varname]['unit']
+        yrs = np.array(ee.List(self.TS[varname]['system:time_start'].tolist()).map(lambda x: ee.Date(x).get('year')).getInfo())
+        vals = self.TS[varname]['b1_mean']
+        unit = '[' + str(np.unique(self.TS[varname]['unit'])[0]) + ']'
     
         ax.set_ylabel("{0} {1}".format(varname, unit.replace('/yr', '')))
         
         slope, intercept, r_value, p_value, std_err = sts.linregress(yrs, vals)
         
         fit = np.polyfit(yrs, vals, 1)
-        fit_fn = np.poly1d(fit) 
+        fit_fn = np.poly1d(fit)
         
         yrs_long = [yrs[0]-1, yrs[-1]+1]
     
@@ -375,10 +324,11 @@ class trend_sheet(object):
         cbar.set_label("Trend [%/year]")
         
         import matplotlib.patches as mpatches
-        
-        patches = [ mpatches.Patch(color='k', label="p-value > 0.1")]
-        ax.legend(handles=patches)#, bbox_to_anchor=(1.05, 1), loc=2, borderaxespad=0. )
 
+        patches = [ mpatches.Patch(color='k', label="p-value > 0.1")]
+        ax.legend(handles=patches)
+
+        
     def save(self):
         
         self.f.suptitle("{2} \n{0} till {1}, {4} ha @ {3} meter/pixel".format(self.Start, self.End, self.Name, int(self.scale.getInfo()), int(self.Area / 10000)), fontsize = 18)           
@@ -387,71 +337,91 @@ class trend_sheet(object):
         
         plt.savefig(self.savepath)
         plt.savefig(self.savepath.replace('.pdf', '.png'))
-        
-    def calcYIELD(self):
-        
-        def _calcYIELD(img):
-            year = img.get('system:time_start')
-            unit = img.get('unit')
-            img = img.multiply(ee.Number(img.get('multiplier'))) ####
-            img = img.multiply(self.HI).divide(1 - self.WC)
-            img = img.set('system:time_start', year).set('multiplier', 1.0).set('unit', unit).set('time_resolution', 'YEAR')
-            return img
-        
-        self.VARS['YIELD'] = self.VARS['AGBP'].map(_calcYIELD).set('variable', 'Yield')
     
-    def fillEXCL(self, path = r"C:\Users\bec\Desktop\test\Book1_proj.xlsx"):
+    def fillEXCL(self, path = r"D:\Github\waterpip\Book1_proj_detailed.xlsx", years_only = False):
         
         self.layout_file = path
         wb = load_workbook(self.layout_file)
         ws = wb['Sheet1']
         
         ws['A1'] = self.Name
-        ws['D17'] = self.HI
-        ws['D19'] = self.WC
         
-        j = 6
+        def _merge_lists(yr, sns):
+            return np.array([yr, sns.reshape((9,2))[:,0], sns.reshape((9,2))[:,1]]).reshape((27), order = 'F')
 
-        for i, val in enumerate(sheet.Columns['AGBP']['TS'][1]): #kg/ha
-            ws['C{0}'.format(i + j)] = val
-            
-        for i, val in enumerate(sheet.Columns['YIELD']['TS'][1]): #kg/ha
-            ws['D{0}'.format(i + j)] = val
-            
-        yield_abs = sheet.Columns['YIELD']['TS'][1] * (self.Area/1e4) / 1e9 #Mton
-        for i, val in enumerate(yield_abs * 1000): #kton
-            ws['E{0}'.format(i + j)] = val
-            
-        att_yield_abs = sheet.Columns['YIELD']['TS95'][1] * (self.Area/1e4) / 1e9 #Mton
-        for i, val in enumerate(att_yield_abs * 1000): #kton
-            ws['F{0}'.format(i + j)] = val
-            
-        for i, val in enumerate((att_yield_abs - yield_abs)*1000): #kton
-            ws['G{0}'.format(i + j)] = val
-            
-        for i, val in enumerate(sheet.Columns['ET']['TS'][1]): #mm
-            ws['H{0}'.format(i + j)] = val        
+        def _fill_vals(vals, column, j = 6):
+            for i, val in enumerate(vals):
+                ws['{0}{1}'.format(column, i + j)] = val
 
-        et_abs = sheet.Columns['ET']['TS'][1] / 1000 * self.Area / 1e9 #km3
-        for i, val in enumerate(et_abs * 1000): # 0.001 km3
-            ws['I{0}'.format(i + j)] = val
-            
-        for i, val in enumerate(sheet.Columns['ET0']['TS'][1]): # mm
-            ws['J{0}'.format(i + j)] = val
-            
-        for i, val in enumerate(sheet.Columns['P']['TS'][1]): # mm
-            ws['K{0}'.format(i + j)] = val
-            
-        for i, val in enumerate(sheet.Columns['WP']['TS'][1]): # kg/m3
-            ws['L{0}'.format(i + j)] = val
-            
-        for i, val in enumerate(sheet.Columns['WP']['TS95'][1]): # kg/m3
-            ws['M{0}'.format(i + j)] = val
+        # AREA [ha]
+        yr_area = self.TS['areas_yr']['b1_sum'].astype(np.float64) / 1e4
+        sns_area = self.TS['areas']['b1_sum'].astype(np.float64) / 1e4
+        vals_area = _merge_lists(yr_area, sns_area)
+        _fill_vals(vals_area, 'C')
+        
+        # AGBP [kg/ha]
+        sns_agbp = self.TS['AGBP']['b1_mean'].astype(np.float64)
+        yr_agbp = self.TS['AGBP_yr']['b1_mean'].astype(np.float64)
+        vals_agbp = _merge_lists(yr_agbp, sns_agbp)
+        _fill_vals(vals_agbp, 'D')
+        
+        # AGBP [kton]
+        vals_agbp_abs = vals_agbp * vals_area / 1e6
+        _fill_vals(vals_agbp_abs, 'E')
 
-        cons_gap = et_abs - ((yield_abs * 1e9 / sheet.Columns['WP']['TS95'][1]) / 1e9) #km3
-        for i, val in enumerate(cons_gap * 1000): # 0.001 km3
-            ws['N{0}'.format(i + j)] = val
-            
+        # Attainable AGBP [kton]   
+        sns_agbp_att = self.TS['AGBP']['b1_p95'].astype(np.float64) * sns_area / 1e6
+        yr_agbp_att = self.TS['AGBP_yr']['b1_p95'].astype(np.float64) * yr_area / 1e6
+        vals_agbp_att = _merge_lists(yr_agbp_att, sns_agbp_att)
+        _fill_vals(vals_agbp_att, 'F')
+        
+        # AGBP Gap [kton]
+        vals_agbp_gap = vals_agbp_att - vals_agbp_abs
+        _fill_vals(vals_agbp_gap, 'G')
+        
+        # ET [mm]
+        sns_et = self.TS['ET']['b1_mean'].astype(np.float64)
+        yr_et = self.TS['ET_yr']['b1_mean'].astype(np.float64)
+        vals_et = _merge_lists(yr_et, sns_et)
+        _fill_vals(vals_et, 'H')
+
+        # ET [0.001 km3]
+        vals_et_abs = vals_et / 1e3 * vals_area * 1e4 / 1e6
+        _fill_vals(vals_et_abs, 'I')
+        
+        # ET0 [mm]
+        yr_et0 = self.TS['ET0_yr']['b1_mean'].astype(np.float64)
+        sns_et0 = self.TS['ET0']['b1_mean'].astype(np.float64)
+        vals_et0 = _merge_lists(yr_et0, sns_et0)
+        _fill_vals(vals_et0, 'J')
+        
+        # P [mm]
+        yr_p = self.TS['P_yr']['b1_mean'].astype(np.float64)
+        sns_p = self.TS['P']['b1_mean'].astype(np.float64)
+        vals_p = _merge_lists(yr_p, sns_p)
+        _fill_vals(vals_p, 'K')
+        
+        # WP [kg/m3]
+        yr_wp = self.TS['WP_yr']['b1_mean'].astype(np.float64)
+        sns_wp = self.TS['WP']['b1_mean'].astype(np.float64)
+        vals_wp = _merge_lists(yr_wp, sns_wp)
+        _fill_vals(vals_wp, 'L')
+
+        # Attainable WP [kg/m3]
+        yr_wp_att = self.TS['WP_yr']['b1_p95'].astype(np.float64)
+        sns_wp_att = self.TS['WP']['b1_p95'].astype(np.float64)
+        vals_wp_att = _merge_lists(yr_wp_att, sns_wp_att)
+        _fill_vals(vals_wp_att, 'M')
+
+        # Potential ET Savings [0.001 km3] 
+        vals_cons_gap = vals_et_abs - (vals_agbp_abs / vals_wp_att)
+        _fill_vals(vals_cons_gap, 'N')
+        
+        if years_only:
+            rows = [x for x in np.arange(6,33,1) if x not in np.arange(6,33,3)]
+            for row in rows:
+                ws.row_dimensions[row].hidden= True
+        
         out = os.path.join(self.OutFldr, "{0}_table.xlsx".format(self.Name))
         wb.save(out)
         
@@ -498,94 +468,157 @@ class trend_sheet(object):
         os.remove(self.path_to_pdf)
     
     def make(self):
+
+        self.TS = dict()
         
-        self.calcYIELD()
+        self.TS['areas'] = geegis.createTS(self.VARS['areas'], self.CountryShape, self.scale, ['sum'], copy_props = ['system:time_start', 'unit'])
+        self.TS['ET']     = geegis.createTS(self.VARS['ET'], self.CountryShape, self.scale, ['mean'], copy_props = ['system:time_start', 'unit'])
+        self.TS['AGBP']   = geegis.createTS(self.VARS['AGBP'], self.CountryShape, self.scale, ['mean', 'p95'], copy_props = ['system:time_start', 'unit'])
+        self.TS['WP']  = geegis.createTS(self.VARS['WP'], self.CountryShape, self.scale, ['mean', 'p95'], copy_props = ['system:time_start', 'unit'])
+        self.TS['P']      = geegis.createTS(self.VARS['P'], self.CountryShape, self.scale, ['mean'], copy_props = ['system:time_start', 'unit'])
+        self.TS['ET0']     = geegis.createTS(self.VARS['ET0'], self.CountryShape, self.scale, ['mean'], copy_props = ['system:time_start', 'unit'])
+
+        self.VARS['areas_yr'] = self.VARS['areas']
+        self.VARS['AGBP_yr'] = self.VARS['AGBP']
+        self.VARS['ET_yr'] = self.VARS['ET']
+        self.VARS['P_yr'] = self.VARS['P']
+        self.VARS['ET0_yr'] = self.VARS['ET0']
+
+        print("Converting to yearly...")
+        # Convert time resolution to yearly for required datasets
+        for varname in ['areas_yr', 'AGBP_yr', 'ET_yr', 'P_yr', 'ET0_yr']:
+            VAR = self.VARS[varname]
+            if varname == 'areas_yr':
+                self.VARS[varname] = geegis.convert_to_yearly(VAR, [self.Start, self.End], reducer = ee.Reducer.median())
+            else:
+                self.VARS[varname] = geegis.convert_to_yearly(VAR, [self.Start, self.End])
+
         self.calcWP()
 
-        for var in ['AGBP', 'ET', 'WP']:
+        self.TS['areas_yr'] = geegis.createTS(self.VARS['areas_yr'], self.CountryShape, self.scale, ['sum'], copy_props = ['system:time_start', 'unit'])
+        self.TS['ET_yr'] = geegis.createTS(self.VARS['ET_yr'], self.CountryShape, self.scale, ['mean'], copy_props = ['system:time_start', 'unit'])
+        self.TS['AGBP_yr'] = geegis.createTS(self.VARS['AGBP_yr'], self.CountryShape, self.scale, ['mean', 'p95'], copy_props = ['system:time_start', 'unit'])
+        self.TS['WP_yr'] = geegis.createTS(self.VARS['WP_yr'], self.CountryShape, self.scale, ['mean', 'p95'], copy_props = ['system:time_start', 'unit'])
+        self.TS['P_yr'] = geegis.createTS(self.VARS['P_yr'], self.CountryShape, self.scale, ['mean'], copy_props = ['system:time_start', 'unit'])
+        self.TS['ET0_yr'] = geegis.createTS(self.VARS['ET0_yr'], self.CountryShape, self.scale, ['mean'], copy_props = ['system:time_start', 'unit'])
+        
+        for var in ['AGBP_yr', 'ET_yr', 'WP_yr']:
             self.createTRENDMAP(var)
-            self.createTS(var)
-            
+
             self.plotHIST(var)
             self.plotTRENDMAP(var)
             self.plotTS(var)
-        
-        self.createTS('P')
-        self.createTS('ET0')
-        
-        self.createTS('YIELD')
-        self.createTS('YIELD', reducer = ee.Reducer.percentile([95]))
-        self.createTS('WP', reducer = ee.Reducer.percentile([95]))
-
 
         self.save()
-        self.fillEXCL(path = r"C:\Users\bec\Desktop\test\Book1_proj.xlsx")
-        
-        self.combine()
-        
-    def make2(self):
-        
-        self.calcYIELD()
-        self.calcWP(base = 'YIELD')
+        self.fillEXCL(years_only = False)
 
-        for var in ['YIELD', 'ET', 'WP']:
-            self.createTRENDMAP(var)
-            self.createTS(var)
+        self.combine()
+
+    
+    def make_seasons(self, varname):
+        
+        PHENie = self.VARS['PHEN']
+        COL = self.VARS[varname]
+        
+        def _make_seasons(string):
+            start_string = ee.String(string).replace('X', 's');
+            end_string = ee.String(string).replace('X', 'e');
+              
+            start = ee.Image(PHENie.filterMetadata('code', 'equals', start_string).first());
+            end = ee.Image(PHENie.filterMetadata('code', 'equals', end_string).first());
             
-            self.plotHIST(var)
-            self.plotTRENDMAP(var)
-            self.plotTS(var)
-        
-        self.createTS('P')
-        self.createTS('ET0')
-        
-        self.createTS('AGBP')
-        self.createTS('YIELD', reducer = ee.Reducer.percentile([95]))
-        self.createTS('WP', reducer = ee.Reducer.percentile([95]))
+            year = ee.Number.parse(ee.String(string).slice(7, 9)).add(2000);
+            season = ee.Number.parse(ee.String(string).slice(10, 11))
+            
+            date1 = ee.Date.fromYMD(year.subtract(1), 1, 1);
+            date2 = date1.advance(10, 'day');
+              
+            delta = date2.millis().subtract(date1.millis());
+              
+            start_idx = ee.Image(date1.millis()).add(start.subtract(1).multiply(delta));
+            end_idx = ee.Image(date1.millis()).add(end.subtract(1).multiply(delta));
+              
+            def _mask_precip(img):
+                current_date = ee.Image(ee.Number(img.get('system:time_start')));
+                    
+                masked_p = ee.Image(img).updateMask(current_date.gt(start_idx)).updateMask(current_date.lt(end_idx));
 
-        self.save()
-        self.fillEXCL(path = r"C:\Users\bec\Desktop\test\Book1_proj.xlsx")
-        
-        self.combine()
-        
-#%%    
+                return masked_p
+            
+            p_season = ee.ImageCollection(COL.map(_mask_precip)).sum().set('code', start_string).set('year', year).set('season', season).set("unit", "mm").set("system:time_start", ee.Date.fromYMD(year, 1, 1).millis()).set('multiplier', 0.1)
+            
+            return p_season
 
+        seasons = ee.List(['L2_PHE_09s1_X', 'L2_PHE_09s2_X','L2_PHE_10s1_X',
+                   'L2_PHE_10s2_X','L2_PHE_11s1_X','L2_PHE_11s2_X',
+                   'L2_PHE_12s1_X','L2_PHE_12s2_X','L2_PHE_13s1_X',
+                   'L2_PHE_13s2_X', 'L2_PHE_14s1_X','L2_PHE_14s2_X',
+                   'L2_PHE_15s1_X','L2_PHE_15s2_X', 'L2_PHE_16s1_X',
+                   'L2_PHE_16s2_X', 'L2_PHE_17s1_X', 'L2_PHE_17s2_X']);
+        
+        return ee.ImageCollection(seasons.map(_make_seasons))
+        
+name = 'Bralirwa'
+
+shape = 'users/bcoerver/Rwanda/Bralirwa_pivots' 
+OutputFolder = r'D:\project_WaterPIP\waterpip_1' 
 
 # 100m example
-sheet = trend_sheet('Wonji', 
-                    None, 
-                    'projects/fao-wapor/L2/L2_AETI_A',
-                    'projects/fao-wapor/L1/L1_PCP_E',
-                    'projects/fao-wapor/L1/L1_RET_E',
-                    'users/bcoerver/Ethiopia_simon/wonji', 
-                    r"C:\Users\bec\Desktop\test",
-                    NPP = 'projects/fao-wapor/L2/L2_NPP_D')
+sheet = trend_sheet(name, shape, OutputFolder)
 
+
+#%% 
 sheet.make()
 
-# 250m example
-sheet = trend_sheet('Githongo', 
-                    'projects/fao-wapor/L1/L1_AGBP_A', 
-                    'projects/fao-wapor/L1/L1_AETI_A',
-                    'projects/fao-wapor/L1/L1_PCP_E',
-                    'projects/fao-wapor/L1/L1_RET_E',
-                    'users/bcoerver/Kenya/ThirdEye/Githongo', 
-                    r"C:\Users\bec\Desktop\test",
-                    NPP = None)
 
-sheet.make()
+#%%
 
-# example with yield calculation, for now the HI and WC needs to be adjusted 
-# inside the code (this should become an input and the functions "make()" and "make2()" should be merged)
-sheet = trend_sheet('Mafambisse', 
-                'projects/fao-wapor/L1/L1_AGBP_A', 
-                'projects/fao-wapor/L1/L1_AETI_A',
-                'projects/fao-wapor/L1/L1_PCP_E',
-                'projects/fao-wapor/L1/L1_RET_E',
-                'users/bcoerver/Mozambique/Mafambisse', 
-                r"C:\Users\bec\Desktop\test")
+#country_table = ee.FeatureCollection(r"USDOS/LSIB_SIMPLE/2017")
+#afri_names_short = country_table.aggregate_array("country_co").getInfo()
+#afri_names_long = country_table.aggregate_array("country_na").getInfo()
+#
+#coi = [##('Rwanda', ' (rainfed & irrigated)', [41, 42]), 
+#       ##('Rwanda', ' (rainfed)', [41]),  
+#       ##('Rwanda', ' (irrigated)', [42]), 
+#       ##('Benin', ' (rainfed & irrigated)', [41, 42]), 
+#       ##('Benin', ' (rainfed)', [41]),   
+#       #('Benin', ' (irrigated)', [42]),  
+#       #('Ethiopia', ' (rainfed & irrigated)', [41, 42]), 
+#       #('Ethiopia', ' (rainfed)', [41]),  
+#       #('Ethiopia', ' (irrigated)', [42]), 
+#       #('Ghana', ' (rainfed & irrigated)', [41, 42]),  
+#       #('Ghana', ' (rainfed)', [41]),   
+#       #('Ghana', ' (irrigated)', [42]),  
+#       #('Kenya', ' (rainfed & irrigated)', [41, 42]),  
+#       #('Kenya', ' (rainfed)', [41]),   
+#       #('Kenya', ' (irrigated)', [42]),  
+#       ('Mozambique', ' (rainfed & irrigated)', [41, 42]), 
+#       #('Mozambique', ' (rainfed)', [41]),  
+#       #('Mozambique', ' (irrigated)', [42])
+#       ]
+#
+#
+#for name, TYPE, mask in coi:
+#
+#    print(name, TYPE, mask)
+#    
+#    AGBP = 'projects/fao-wapor/L2/L2_AGBP_S'
+#    WP = 'projects/fao-wapor/L2/L2_GBWP_S'
+#    P = 'projects/fao-wapor/L1/L1_PCP_E'
+#    ETref = 'projects/fao-wapor/L1/L1_RET_E'
+#    PHEN = 'projects/fao-wapor/L2/L2_PHE_S'
+#    LULC = 'projects/fao-wapor/L1/L1_LCC_A'
+#    
+#    CountryShape = country_table.filterMetadata('country_na', "equals", name).geometry()
+#    OutputFolder = r"C:\Users\bec\Desktop\wapor_countries"
+#    
+#    # 100m example
+#    sheet = trend_sheet(name+TYPE, AGBP, WP, P, ETref, PHEN, LULC, CountryShape, OutputFolder, mask = mask)
+#    
+#    sheet.make()
 
-sheet.make2()
+
+
 #%%
 #
 #shapes = [
