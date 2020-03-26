@@ -557,6 +557,8 @@ class trend_sheet(object):
                    'L2_PHE_16s2_X', 'L2_PHE_17s1_X', 'L2_PHE_17s2_X']);
         
         return ee.ImageCollection(seasons.map(_make_seasons))
+
+#%%
         
 name = 'Bralirwa'
 shape = 'users/bcoerver/Rwanda/Bralirwa_pivots' 
